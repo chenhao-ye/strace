@@ -10,13 +10,33 @@
  */
 
 #include "defs.h"
+#include "list.h"
 #include <linux/aio_abi.h>
+#include <stdlib.h>
 
 #include "xlat/aio_cmds.h"
 
 #ifdef HAVE_STRUCT_IOCB_AIO_FLAGS
 # include "xlat/aio_iocb_flags.h"
 #endif
+
+struct aio_tag {
+	// used to match io_submit and io_pgetevents
+	uint64_t aio_data;
+	// make a copy of iocb
+	struct iocb cb;
+	struct aio_tag* parent;
+	// what other aio_tag that depend on the current one
+	struct aio_tag* head_child;
+	// other sibling nodes
+	struct list_item sibling;
+	// linked with other active nodes (null if no longer active)
+	struct list_item active;
+};
+
+// the aio that we just release; whatever new coming aio is its children
+struct aio_tag* aio_curr_parent;
+struct aio_tag* aio_active_head;
 
 SYS_FUNC(io_setup)
 {
@@ -134,6 +154,31 @@ print_iocb_header(struct tcb *tcp, const struct iocb *cb)
 static void
 print_iocb(struct tcb *tcp, const struct iocb *cb)
 {
+	/**
+	 * Hijack iocb printing: it only gets called in io_submit, so we keep a record
+	 * of all the iocb that flowing through here
+	 */
+	if (!aio_curr_parent) { // create a "fake" parent first
+		aio_curr_parent = calloc(1, sizeof(struct aio_tag));
+		aio_active_head = calloc(1, sizeof(struct aio_tag));
+		list_init(&aio_active_head->active);
+	}
+
+	struct aio_tag* tag = calloc(1, sizeof(struct aio_tag));
+	tag->aio_data = cb->aio_data;
+	tag->cb = *cb;
+	tag->parent = aio_curr_parent;
+	tag->head_child = NULL;
+	// attach to aio_active_head
+	list_append(&aio_active_head->active, &tag->active);
+	// attach as a child of the current parent
+	if (!aio_curr_parent->head_child) {
+		aio_curr_parent->head_child = tag;
+		list_init(&tag->sibling);
+	} else {
+		list_append(&aio_curr_parent->head_child->sibling, &tag->sibling);
+	}
+
 	tprint_struct_begin();
 
 	enum iocb_sub sub = print_iocb_header(tcp, cb);
