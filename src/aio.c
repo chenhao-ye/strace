@@ -311,8 +311,8 @@ print_io_event(struct tcb *tcp, void *elem_buf, size_t elem_size, void *data)
 	}
 
 	if (!tag) {
-		tprintf("Fail to find io_event!");
-		return true;
+		tprintf("/**Fail to find io_event!**/");
+		goto do_print;
 	}
 	// dump the current parent's dependency
 	if (aio_curr_parent) {
@@ -332,6 +332,7 @@ print_io_event(struct tcb *tcp, void *elem_buf, size_t elem_size, void *data)
 	// activate draining
 	aio_is_drain = 1;
 
+do_print:
 	tprint_struct_begin();
 	PRINT_FIELD_X(*event, data);
 	tprint_struct_next();
