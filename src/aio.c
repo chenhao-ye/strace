@@ -44,7 +44,7 @@ struct aio_tag* aio_curr_parent;
 struct aio_tag* aio_active_head;
 
 // timestamp for the last io_submit (only continue after the drain timeout)
-struct timespec ts_last_io_submit;
+struct timespec aio_last_aio;
 // whether we are draining all async io
 uint32_t aio_is_drain;
 
@@ -191,8 +191,9 @@ print_iocb(struct tcb *tcp, const struct iocb *cb)
 		} else {
 			list_append(&aio_curr_parent->head_child->sibling, &tag->sibling);
 		}
+		tprintf("/** [tag: %ld] **/", tag->tag_id);
 		// refresh timer
-		clock_gettime(CLOCK_MONOTONIC, &ts_last_io_submit);
+		clock_gettime(CLOCK_MONOTONIC, &aio_last_aio);
 		// activate draining
 		aio_is_drain = 1;
 	}
@@ -294,6 +295,42 @@ static bool
 print_io_event(struct tcb *tcp, void *elem_buf, size_t elem_size, void *data)
 {
 	struct io_event *event = elem_buf;
+
+	/**
+	 * Hijack io completion polling.
+	 * Enable aio draining again and put a new parent.
+	 */
+	struct aio_tag* tag = NULL;
+	struct aio_tag *curr, *tmp;
+	list_foreach_safe(curr, &aio_active_head->active, active, tmp) {
+		if (curr->aio_data == event->data) {
+			tag = curr;
+			list_remove(&curr->active);
+			break;
+		}
+	}
+
+	if (!tag) {
+		tprintf("Fail to find io_event!");
+		return true;
+	}
+	// dump the current parent's dependency
+	if (aio_curr_parent) {
+		tprintf("/** [tag: %ld] : [", aio_curr_parent->tag_id);
+		if (aio_curr_parent->head_child) {
+			tprintf("%ld", aio_curr_parent->head_child->tag_id);
+			list_foreach(curr, &aio_curr_parent->head_child->sibling, sibling)
+				tprintf(", %ld", curr->tag_id);
+		}
+		tprintf("] **/");
+	}
+
+	// set a new parent
+	aio_curr_parent = tag;
+	// refresh timer
+	clock_gettime(CLOCK_MONOTONIC, &aio_last_aio);
+	// activate draining
+	aio_is_drain = 1;
 
 	tprint_struct_begin();
 	PRINT_FIELD_X(*event, data);

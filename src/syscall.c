@@ -516,11 +516,14 @@ tamper_with_syscall_entering(struct tcb *tcp, unsigned int *signo)
 		if (opts->data.flags & INJECT_F_SIGNAL)
 			*signo = opts->data.signo;
 		// only do injection if we are draining async io
-		if (opts->data.flags & (INJECT_F_ERROR | INJECT_F_RETVAL) && aio_is_drain) {
+		if (opts->data.flags & (INJECT_F_ERROR | INJECT_F_RETVAL)) {
 			kernel_long_t scno =
 				(opts->data.flags & INJECT_F_SYSCALL)
 				? (kernel_long_t) shuffle_scno(opts->data.scno)
 				: -1;
+			// if not drain, keep it untouched
+			if (!aio_is_drain)
+				scno = tcp->scno;
 
 			if (!arch_set_scno(tcp, scno)) {
 				tcp->flags |= TCB_TAMPERED;
@@ -581,12 +584,14 @@ tamper_with_syscall_exiting(struct tcb *tcp)
 	}
 
 	// this only happens when we are draining
-	if (aio_is_drain) {
-		if (opts->data.flags & INJECT_F_RETVAL)
+	if (opts->data.flags & INJECT_F_RETVAL) {
+		// if is drain, do retval injection; otherwise inject 1
+		if (aio_is_drain)
 			set_success(tcp, retval_get(opts->data.rval_idx));
 		else
-			set_error(tcp, retval_get(opts->data.rval_idx));
-	}
+			set_success(tcp, 1);
+	} else
+		set_error(tcp, retval_get(opts->data.rval_idx));
 
 	return 0;
 }
@@ -675,9 +680,10 @@ syscall_entering_trace(struct tcb *tcp, unsigned int *sig)
 	if (aio_is_drain) {
 		struct timespec ts_now, ts_diff;
 		clock_gettime(CLOCK_MONOTONIC, &ts_now);
-		ts_sub(&ts_diff, &ts_now, &ts_last_io_submit);
-		if (ts_diff.tv_sec * 1000000000 + ts_diff.tv_nsec > AIO_DRAIN_TIMEOUT_NS)
+		ts_sub(&ts_diff, &ts_now, &aio_last_aio);
+		if (ts_diff.tv_sec * 1000000000 + ts_diff.tv_nsec > AIO_DRAIN_TIMEOUT_NS) {
 			aio_is_drain = 0;
+		}
 	}
 
 	if (inject(tcp))
