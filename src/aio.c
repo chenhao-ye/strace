@@ -315,7 +315,7 @@ collect_io_event(struct tcb *tcp, void *elem_buf, size_t elem_size, void *data) 
 	}
 	tprintf("<tag-%ld>", tag->tag_id);
 	if (!tag) {
-		tprintf(" /***[ERR]: Fail to find io_event to collect!***/ ");
+		tprintf("[ERR]: Fail to find io_event to collect!");
 		return false;
 	}
 	// make a copy of the event
@@ -349,7 +349,7 @@ release_and_print_io_event(struct tcb *tcp, kernel_ulong_t start_addr, size_t id
 {
 	struct aio_tag* tag = list_next(aio_ready_head, ready);
 	if (!tag) {
-		tprintf(" /***[ERR]: Fail to find io_event to print!***/ ");
+		tprintf(" /**[ERR]: Fail to find io_event to print!**/ ");
 		return false;
 	}
 	release_io_event(tag);
