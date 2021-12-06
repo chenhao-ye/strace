@@ -191,7 +191,7 @@ print_iocb(struct tcb *tcp, const struct iocb *cb)
 		} else {
 			list_append(&aio_curr_parent->head_child->sibling, &tag->sibling);
 		}
-		tprintf("/** [tag: %ld] **/", tag->tag_id);
+		tprintf("/**[tag: %ld]**/", tag->tag_id);
 		// refresh timer
 		clock_gettime(CLOCK_MONOTONIC, &aio_last_aio);
 		// activate draining
@@ -316,13 +316,13 @@ print_io_event(struct tcb *tcp, void *elem_buf, size_t elem_size, void *data)
 	}
 	// dump the current parent's dependency
 	if (aio_curr_parent) {
-		tprintf("/** [tag: %ld] : [", aio_curr_parent->tag_id);
+		tprintf("/**[tag: %ld] : [", aio_curr_parent->tag_id);
 		if (aio_curr_parent->head_child) {
 			tprintf("%ld", aio_curr_parent->head_child->tag_id);
 			list_foreach(curr, &aio_curr_parent->head_child->sibling, sibling)
 				tprintf(", %ld", curr->tag_id);
 		}
-		tprintf("] **/");
+		tprintf("]**/");
 	}
 
 	// set a new parent
