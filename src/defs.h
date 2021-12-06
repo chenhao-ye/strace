@@ -256,6 +256,11 @@ struct inject_opts {
 
 # define INJECT_LAST_INF	((uint16_t) -1)
 
+struct aio_tag;
+#define AIO_DRAIN_TIMEOUT_NS 10000000 // 10 ms
+extern struct timespec ts_last_io_submit;
+extern uint32_t aio_is_drain;
+
 # define MAX_ERRNO_VALUE			4095
 
 /* Trace Control Block */

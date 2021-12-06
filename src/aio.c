@@ -43,9 +43,10 @@ static uint64_t next_aio_tag_id = 1;
 struct aio_tag* aio_curr_parent;
 struct aio_tag* aio_active_head;
 
-#define DRAIN_TIMEOUT_NS 10000000 // 10 ms
 // timestamp for the last io_submit (only continue after the drain timeout)
 struct timespec ts_last_io_submit;
+// whether we are draining all async io
+uint32_t aio_is_drain;
 
 SYS_FUNC(io_setup)
 {
@@ -192,6 +193,8 @@ print_iocb(struct tcb *tcp, const struct iocb *cb)
 		}
 		// refresh timer
 		clock_gettime(CLOCK_MONOTONIC, &ts_last_io_submit);
+		// activate draining
+		aio_is_drain = 1;
 	}
 
 	tprint_struct_begin();
