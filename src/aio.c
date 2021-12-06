@@ -28,25 +28,28 @@ struct aio_tag {
 	uint64_t aio_data;
 	// make a copy of iocb
 	struct iocb cb;
+	// make a copy of ready event
+	struct io_event event;
 	struct aio_tag* parent;
 	// what other aio_tag that depend on the current one
 	struct aio_tag* head_child;
 	// other sibling nodes
 	struct list_item sibling;
-	// linked with other active nodes (null if no longer active)
-	struct list_item active;
+	// linked with other pending nodes (null if no longer pending)
+	struct list_item pending;
+	// linked with other ready nodes
+	struct list_item ready;
 };
 
 static uint64_t next_aio_tag_id = 1;
 
 // the aio that we just release; whatever new coming aio is its children
 struct aio_tag* aio_curr_parent;
-struct aio_tag* aio_active_head;
+struct aio_tag* aio_pending_head;
+struct aio_tag* aio_ready_head;
 
 // timestamp for the last io_submit (only continue after the drain timeout)
 struct timespec aio_last_aio;
-// whether we are draining all async io
-uint32_t aio_is_drain;
 
 SYS_FUNC(io_setup)
 {
@@ -169,10 +172,12 @@ print_iocb(struct tcb *tcp, const struct iocb *cb)
 	 * of all the iocb that flowing through here
 	 */
 	if (!aio_curr_parent) {
-		// create a "fake" parent and active list head node
+		// create a "fake" parent and pending list head node
 		aio_curr_parent = calloc(1, sizeof(struct aio_tag));
-		aio_active_head = calloc(1, sizeof(struct aio_tag));
-		list_init(&aio_active_head->active);
+		aio_pending_head = calloc(1, sizeof(struct aio_tag));
+		aio_ready_head = calloc(1, sizeof(struct aio_tag));
+		list_init(&aio_pending_head->pending);
+		list_init(&aio_ready_head->ready);
 	}
 
 	if (cb->aio_lio_opcode != IOCB_CMD_POLL && cb->aio_lio_opcode != IOCB_CMD_NOOP) {
@@ -182,8 +187,8 @@ print_iocb(struct tcb *tcp, const struct iocb *cb)
 		tag->cb = *cb;
 		tag->parent = aio_curr_parent;
 		tag->head_child = NULL;
-		// attach to aio_active_head
-		list_append(&aio_active_head->active, &tag->active);
+		// attach to aio_pending_head
+		list_append(&aio_pending_head->pending, &tag->pending);
 		// attach as a child of the current parent
 		if (!aio_curr_parent->head_child) {
 			aio_curr_parent->head_child = tag;
@@ -191,11 +196,10 @@ print_iocb(struct tcb *tcp, const struct iocb *cb)
 		} else {
 			list_append(&aio_curr_parent->head_child->sibling, &tag->sibling);
 		}
-		tprintf("/**[tag: %ld]**/", tag->tag_id);
+		tprintf(" /**<tag-%ld>**/ ", tag->tag_id);
 		// refresh timer
 		clock_gettime(CLOCK_MONOTONIC, &aio_last_aio);
 		// activate draining
-		aio_is_drain = 1;
 	}
 
 	tprint_struct_begin();
@@ -291,9 +295,9 @@ SYS_FUNC(io_submit)
 	return RVAL_DECODED;
 }
 
+// collect ready io_events (already wrapped inside a comment)
 static bool
-print_io_event(struct tcb *tcp, void *elem_buf, size_t elem_size, void *data)
-{
+collect_io_event(struct tcb *tcp, void *elem_buf, size_t elem_size, void *data) {
 	struct io_event *event = elem_buf;
 
 	/**
@@ -302,37 +306,59 @@ print_io_event(struct tcb *tcp, void *elem_buf, size_t elem_size, void *data)
 	 */
 	struct aio_tag* tag = NULL;
 	struct aio_tag *curr, *tmp;
-	list_foreach_safe(curr, &aio_active_head->active, active, tmp) {
+	list_foreach_safe(curr, &aio_pending_head->pending, pending, tmp) {
 		if (curr->aio_data == event->data) {
 			tag = curr;
-			list_remove(&curr->active);
+			list_remove(&curr->pending);
 			break;
 		}
 	}
-
+	tprintf("<tag-%ld>", tag->tag_id);
 	if (!tag) {
-		tprintf("/**Fail to find io_event!**/");
-		goto do_print;
+		tprintf(" /***[ERR]: Fail to find io_event to collect!***/ ");
+		return false;
 	}
+	// make a copy of the event
+	tag->event = *event;
+	list_append(&aio_ready_head->ready, &tag->ready);
+	return true;
+}
+
+static void
+release_io_event(struct aio_tag* tag) {
+	struct aio_tag *curr;
 	// dump the current parent's dependency
 	if (aio_curr_parent) {
-		tprintf("/**[tag: %ld] : [", aio_curr_parent->tag_id);
+		tprintf(" /**[DEP]: <tag-%ld>: [", aio_curr_parent->tag_id);
 		if (aio_curr_parent->head_child) {
 			tprintf("%ld", aio_curr_parent->head_child->tag_id);
 			list_foreach(curr, &aio_curr_parent->head_child->sibling, sibling)
 				tprintf(", %ld", curr->tag_id);
 		}
-		tprintf("]**/");
+		tprintf("]**/ ");
 	}
 
 	// set a new parent
 	aio_curr_parent = tag;
 	// refresh timer
 	clock_gettime(CLOCK_MONOTONIC, &aio_last_aio);
-	// activate draining
-	aio_is_drain = 1;
+}
 
-do_print:
+static bool
+release_and_print_io_event(struct tcb *tcp, kernel_ulong_t start_addr, size_t idx)
+{
+	struct aio_tag* tag = list_next(aio_ready_head, ready);
+	if (!tag) {
+		tprintf(" /***[ERR]: Fail to find io_event to print!***/ ");
+		return false;
+	}
+	release_io_event(tag);
+	struct io_event *event = &tag->event;
+
+	tprintf(" /**[RELEASE]: <tag-%ld>**/ ", tag->tag_id);
+	// copy io events back to the tracee's memory
+	upoken(tcp, start_addr + sizeof(struct io_event) * idx, sizeof(struct io_event), event);
+
 	tprint_struct_begin();
 	PRINT_FIELD_X(*event, data);
 	tprint_struct_next();
@@ -343,6 +369,26 @@ do_print:
 	PRINT_FIELD_D(*event, res2);
 	tprint_struct_end();
 
+	// remove from the list
+	list_remove(&tag->ready);
+
+	return true;
+}
+
+static bool
+print_io_event(struct tcb *tcp, void *elem_buf, size_t elem_size, void *data)
+{
+	struct io_event *event = elem_buf;
+
+	tprint_struct_begin();
+	PRINT_FIELD_X(*event, data);
+	tprint_struct_next();
+	PRINT_FIELD_X(*event, obj);
+	tprint_struct_next();
+	PRINT_FIELD_D(*event, res);
+	tprint_struct_next();
+	PRINT_FIELD_D(*event, res2);
+	tprint_struct_end();
 	return true;
 }
 
@@ -393,8 +439,18 @@ print_io_getevents(struct tcb *const tcp, const print_obj_by_addr_fn print_ts,
 	} else {
 		/* events */
 		struct io_event buf;
-		print_array(tcp, tcp->u_arg[3], tcp->u_rval, &buf, sizeof(buf),
-			    tfetch_mem, print_io_event, 0);
+		// collect io events
+		if (tcp->u_rval_bk > 0) {
+			tprints(" /**[COLLECT]: ");
+			print_array(tcp, tcp->u_arg[3], tcp->u_rval_bk, &buf, sizeof(buf),
+						tfetch_mem, collect_io_event, 0);
+			tprints("**/ ");
+		}
+		// then do printing according to (tampered) retval
+		tprints("[");
+		for (int i = 0; i < tcp->u_rval; ++i)
+			release_and_print_io_event(tcp, tcp->u_arg[3], i);
+		tprints("]");
 		tprint_arg_next();
 
 		/*

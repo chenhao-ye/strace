@@ -257,9 +257,8 @@ struct inject_opts {
 # define INJECT_LAST_INF	((uint16_t) -1)
 
 struct aio_tag;
-#define AIO_DRAIN_TIMEOUT_NS 10000000 // 10 ms
+#define AIO_DRAIN_TIMEOUT_NS 1000000 // 100 us
 extern struct timespec aio_last_aio;
-extern uint32_t aio_is_drain;
 
 # define MAX_ERRNO_VALUE			4095
 
@@ -276,6 +275,7 @@ struct tcb {
 	kernel_ulong_t true_scno;	/* Same, but without subcall decoding and shuffling */
 	kernel_ulong_t u_arg[MAX_ARGS];	/* System call arguments */
 	kernel_long_t u_rval;	/* Return value */
+	kernel_long_t u_rval_bk;	/* Return value (backup copy if tampered) */
 	int sys_func_rval;	/* Syscall entry parser's return value */
 	int curcol;		/* Output column for this process */
 	FILE *outf;		/* Output file for this process */

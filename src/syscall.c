@@ -515,7 +515,12 @@ tamper_with_syscall_entering(struct tcb *tcp, unsigned int *signo)
 	if (!recovering(tcp)) {
 		if (opts->data.flags & INJECT_F_SIGNAL)
 			*signo = opts->data.signo;
-		if (opts->data.flags & (INJECT_F_ERROR | INJECT_F_RETVAL)) {
+		// we just set it to be tampered but don't actually hijack it
+		// the actual hijack happens in the retval
+		if (opts->data.flags & INJECT_F_RETVAL) {
+			tcp->flags |= TCB_TAMPERED | TCB_TAMPERED_NO_FAIL;
+		}
+		if (opts->data.flags & INJECT_F_ERROR) {
 			kernel_long_t scno =
 				(opts->data.flags & INJECT_F_SYSCALL)
 				? (kernel_long_t) shuffle_scno(opts->data.scno)
@@ -579,10 +584,18 @@ tamper_with_syscall_exiting(struct tcb *tcp)
 		return 1;
 	}
 
-	// this only happens when we are draining
-	if (opts->data.flags & INJECT_F_RETVAL)
-		set_success(tcp, retval_get(opts->data.rval_idx));
-	else
+	if (opts->data.flags & INJECT_F_RETVAL) {
+		// this only happens when we are draining
+		struct timespec ts_now, ts_diff;
+		clock_gettime(CLOCK_MONOTONIC, &ts_now);
+		ts_sub(&ts_diff, &ts_now, &aio_last_aio);
+		if (ts_diff.tv_sec * 1000000000 + ts_diff.tv_nsec > AIO_DRAIN_TIMEOUT_NS) {
+			// release one io_event
+			set_success(tcp, 1);
+		} else {
+			set_success(tcp, retval_get(opts->data.rval_idx));
+		}
+	} else
 		set_error(tcp, retval_get(opts->data.rval_idx));
 
 	return 0;
@@ -667,16 +680,6 @@ syscall_entering_trace(struct tcb *tcp, unsigned int *sig)
 	}
 
 	tcp->flags &= ~TCB_FILTERED;
-
-	// make a decision to see if we are pausing aio draining
-	if (aio_is_drain) {
-		struct timespec ts_now, ts_diff;
-		clock_gettime(CLOCK_MONOTONIC, &ts_now);
-		ts_sub(&ts_diff, &ts_now, &aio_last_aio);
-		if (ts_diff.tv_sec * 1000000000 + ts_diff.tv_nsec > AIO_DRAIN_TIMEOUT_NS) {
-			aio_is_drain = 0;
-		}
-	}
 
 	if (inject(tcp))
 		tamper_with_syscall_entering(tcp, sig);
@@ -1557,6 +1560,7 @@ set_success(struct tcb *tcp, kernel_long_t new_rval)
 		return;
 #endif
 
+	tcp->u_rval_bk = old_rval;
 	tcp->u_rval = new_rval;
 	if (arch_set_success(tcp)) {
 		tcp->u_rval = old_rval;
