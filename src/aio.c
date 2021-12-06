@@ -12,6 +12,7 @@
 #include "defs.h"
 #include "list.h"
 #include <linux/aio_abi.h>
+#include <stdint.h>
 #include <stdlib.h>
 
 #include "xlat/aio_cmds.h"
@@ -21,6 +22,8 @@
 #endif
 
 struct aio_tag {
+	// enumerate for easy naming
+	uint64_t tag_id;
 	// used to match io_submit and io_pgetevents
 	uint64_t aio_data;
 	// make a copy of iocb
@@ -34,9 +37,15 @@ struct aio_tag {
 	struct list_item active;
 };
 
+static uint64_t next_aio_tag_id = 1;
+
 // the aio that we just release; whatever new coming aio is its children
 struct aio_tag* aio_curr_parent;
 struct aio_tag* aio_active_head;
+
+#define DRAIN_TIMEOUT_NS 10000000 // 10 ms
+// timestamp for the last io_submit (only continue after the drain timeout)
+struct timespec ts_last_io_submit;
 
 SYS_FUNC(io_setup)
 {
@@ -158,25 +167,31 @@ print_iocb(struct tcb *tcp, const struct iocb *cb)
 	 * Hijack iocb printing: it only gets called in io_submit, so we keep a record
 	 * of all the iocb that flowing through here
 	 */
-	if (!aio_curr_parent) { // create a "fake" parent first
+	if (!aio_curr_parent) {
+		// create a "fake" parent and active list head node
 		aio_curr_parent = calloc(1, sizeof(struct aio_tag));
 		aio_active_head = calloc(1, sizeof(struct aio_tag));
 		list_init(&aio_active_head->active);
 	}
 
-	struct aio_tag* tag = calloc(1, sizeof(struct aio_tag));
-	tag->aio_data = cb->aio_data;
-	tag->cb = *cb;
-	tag->parent = aio_curr_parent;
-	tag->head_child = NULL;
-	// attach to aio_active_head
-	list_append(&aio_active_head->active, &tag->active);
-	// attach as a child of the current parent
-	if (!aio_curr_parent->head_child) {
-		aio_curr_parent->head_child = tag;
-		list_init(&tag->sibling);
-	} else {
-		list_append(&aio_curr_parent->head_child->sibling, &tag->sibling);
+	if (cb->aio_lio_opcode != IOCB_CMD_POLL && cb->aio_lio_opcode != IOCB_CMD_NOOP) {
+		struct aio_tag* tag = calloc(1, sizeof(struct aio_tag));
+		tag->tag_id = next_aio_tag_id++;
+		tag->aio_data = cb->aio_data;
+		tag->cb = *cb;
+		tag->parent = aio_curr_parent;
+		tag->head_child = NULL;
+		// attach to aio_active_head
+		list_append(&aio_active_head->active, &tag->active);
+		// attach as a child of the current parent
+		if (!aio_curr_parent->head_child) {
+			aio_curr_parent->head_child = tag;
+			list_init(&tag->sibling);
+		} else {
+			list_append(&aio_curr_parent->head_child->sibling, &tag->sibling);
+		}
+		// refresh timer
+		clock_gettime(CLOCK_MONOTONIC, &ts_last_io_submit);
 	}
 
 	tprint_struct_begin();
