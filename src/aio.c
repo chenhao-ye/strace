@@ -41,15 +41,70 @@ struct aio_tag {
 	struct list_item ready;
 };
 
+struct aio_tag_ctx {
+	// associated ctx with iocb
+	aio_context_t ctx_id;
+
+	// the aio that we just release; whatever new coming aio is its children
+	struct aio_tag* curr_parent;
+	// lists of aio_tag:
+	struct list_item pending_list;
+	struct list_item ready_list;
+
+	// timestamp for the last io_submit (only continue after the drain timeout)
+	struct timespec last_req_ts;
+
+	// linked together with other aio_tag_ctx
+	struct list_item peer;
+};
+
 static uint64_t next_aio_tag_id = 1;
+static EMPTY_LIST(aio_ctx_list);
+// set to the current aio_tag_ctx in io_submit when reading ctx_id
+struct aio_tag_ctx* aio_ctx_curr = NULL;
 
-// the aio that we just release; whatever new coming aio is its children
-struct aio_tag* aio_curr_parent;
-struct aio_tag* aio_pending_head;
-struct aio_tag* aio_ready_head;
+struct timespec drain_timeout = { .tv_sec = 0, .tv_nsec = 100000 };
 
-// timestamp for the last io_submit (only continue after the drain timeout)
-struct timespec aio_last_aio;
+// check whether it has been timeout for draining
+// if yes, reset the timer
+bool
+check_drain_timeout(void) {
+	struct timespec ts_now, ts_diff;
+	clock_gettime(CLOCK_MONOTONIC, &ts_now);
+	ts_sub(&ts_diff, &ts_now, &aio_ctx_curr->last_req_ts);
+	if (ts_cmp(&ts_diff, &drain_timeout) < 0) return false;
+	aio_ctx_curr->last_req_ts = ts_now;
+	return true;
+}
+
+
+// set the global variable aio_ctx_curr to the correct one
+// assume ctx is the first argument
+static void
+set_curr_aio_ctx(struct tcb *tcp) {
+	aio_context_t ctx_id = tcp->u_arg[0];
+	aio_ctx_curr = NULL;
+	struct aio_tag_ctx* i;
+	list_foreach(i, &aio_ctx_list, peer) {
+		if (i->ctx_id == ctx_id) {
+			aio_ctx_curr = i;
+			break;
+		}
+	}
+	if (!aio_ctx_curr) {
+		aio_ctx_curr = calloc(1, sizeof(struct aio_tag_ctx));
+		aio_ctx_curr->ctx_id = ctx_id;
+		list_append(&aio_ctx_list, &aio_ctx_curr->peer);
+		list_init(&aio_ctx_curr->pending_list);
+		list_init(&aio_ctx_curr->ready_list);
+		// create a "fake" parent
+		aio_ctx_curr->curr_parent = calloc(1, sizeof(struct aio_tag));
+	}
+}
+
+// NOTE: we don't add aio_tag_ctx in io_setup but lazily on io_submit when the
+// given ctx_id does not match, because we may miss io_setup when trace starts,
+// and handling inside io_submit might be a better idea.
 
 SYS_FUNC(io_setup)
 {
@@ -67,6 +122,9 @@ SYS_FUNC(io_setup)
 
 SYS_FUNC(io_destroy)
 {
+	/*** matching the corresponding context ***/
+	set_curr_aio_ctx(tcp);
+
 	/* ctx_id */
 	printaddr(tcp->u_arg[0]);
 
@@ -169,36 +227,27 @@ print_iocb(struct tcb *tcp, const struct iocb *cb)
 {
 	/**
 	 * Hijack iocb printing: it only gets called in io_submit, so we keep a record
-	 * of all the iocb that flowing through here
+	 * of all the iocb flowing through
 	 */
-	if (!aio_curr_parent) {
-		// create a "fake" parent and pending list head node
-		aio_curr_parent = calloc(1, sizeof(struct aio_tag));
-		aio_pending_head = calloc(1, sizeof(struct aio_tag));
-		aio_ready_head = calloc(1, sizeof(struct aio_tag));
-		list_init(&aio_pending_head->pending);
-		list_init(&aio_ready_head->ready);
-	}
-
 	if (cb->aio_lio_opcode != IOCB_CMD_POLL && cb->aio_lio_opcode != IOCB_CMD_NOOP) {
 		struct aio_tag* tag = calloc(1, sizeof(struct aio_tag));
 		tag->tag_id = next_aio_tag_id++;
 		tag->aio_data = cb->aio_data;
 		tag->cb = *cb;
-		tag->parent = aio_curr_parent;
+		tag->parent = aio_ctx_curr->curr_parent;
 		tag->head_child = NULL;
-		// attach to aio_pending_head
-		list_append(&aio_pending_head->pending, &tag->pending);
-		// attach as a child of the current parent
-		if (!aio_curr_parent->head_child) {
-			aio_curr_parent->head_child = tag;
+		// add to the pending list
+		list_append(&aio_ctx_curr->pending_list, &tag->pending);
+		// add as a child of the current parent
+		if (!aio_ctx_curr->curr_parent->head_child) {
+			aio_ctx_curr->curr_parent->head_child = tag;
 			list_init(&tag->sibling);
 		} else {
-			list_append(&aio_curr_parent->head_child->sibling, &tag->sibling);
+			list_append(&aio_ctx_curr->curr_parent->head_child->sibling, &tag->sibling);
 		}
 		tprintf(" /**<tag-%ld>**/ ", tag->tag_id);
 		// refresh timer
-		clock_gettime(CLOCK_MONOTONIC, &aio_last_aio);
+		clock_gettime(CLOCK_MONOTONIC, &aio_ctx_curr->last_req_ts);
 		// activate draining
 	}
 
@@ -275,6 +324,9 @@ SYS_FUNC(io_submit)
 	const kernel_ulong_t addr = tcp->u_arg[2];
 	kernel_ulong_t iocbp;
 
+	/*** matching the corresponding context ***/
+	set_curr_aio_ctx(tcp);
+
 	/* ctx_id */
 	printaddr(tcp->u_arg[0]);
 	tprint_arg_next();
@@ -306,7 +358,7 @@ collect_io_event(struct tcb *tcp, void *elem_buf, size_t elem_size, void *data) 
 	 */
 	struct aio_tag* tag = NULL;
 	struct aio_tag *curr, *tmp;
-	list_foreach_safe(curr, &aio_pending_head->pending, pending, tmp) {
+	list_foreach_safe(curr, &aio_ctx_curr->pending_list, pending, tmp) {
 		if (curr->aio_data == event->data) {
 			tag = curr;
 			list_remove(&curr->pending);
@@ -320,7 +372,7 @@ collect_io_event(struct tcb *tcp, void *elem_buf, size_t elem_size, void *data) 
 	}
 	// make a copy of the event
 	tag->event = *event;
-	list_append(&aio_ready_head->ready, &tag->ready);
+	list_append(&aio_ctx_curr->ready_list, &tag->ready);
 	return true;
 }
 
@@ -328,26 +380,26 @@ static void
 release_io_event(struct aio_tag* tag) {
 	struct aio_tag *curr;
 	// dump the current parent's dependency
-	if (aio_curr_parent) {
-		tprintf(" /**[DEP]: <tag-%ld>: [", aio_curr_parent->tag_id);
-		if (aio_curr_parent->head_child) {
-			tprintf("%ld", aio_curr_parent->head_child->tag_id);
-			list_foreach(curr, &aio_curr_parent->head_child->sibling, sibling)
+	if (aio_ctx_curr->curr_parent) {
+		tprintf(" /**[DEP]: <tag-%ld>: [", aio_ctx_curr->curr_parent->tag_id);
+		if (aio_ctx_curr->curr_parent->head_child) {
+			tprintf("%ld", aio_ctx_curr->curr_parent->head_child->tag_id);
+			list_foreach(curr, &aio_ctx_curr->curr_parent->head_child->sibling, sibling)
 				tprintf(", %ld", curr->tag_id);
 		}
 		tprintf("]**/ ");
 	}
 
 	// set a new parent
-	aio_curr_parent = tag;
+	aio_ctx_curr->curr_parent = tag;
 	// refresh timer
-	clock_gettime(CLOCK_MONOTONIC, &aio_last_aio);
+	clock_gettime(CLOCK_MONOTONIC, &aio_ctx_curr->last_req_ts);
 }
 
 static bool
 release_and_print_io_event(struct tcb *tcp, kernel_ulong_t start_addr, size_t idx)
 {
-	struct aio_tag* tag = list_next(aio_ready_head, ready);
+	struct aio_tag* tag = list_head(&aio_ctx_curr->ready_list, struct aio_tag, ready);
 	if (!tag) {
 		tprintf(" /**[ERR]: Fail to find io_event to print!**/ ");
 		return false;
@@ -394,6 +446,9 @@ print_io_event(struct tcb *tcp, void *elem_buf, size_t elem_size, void *data)
 
 SYS_FUNC(io_cancel)
 {
+	/*** matching the corresponding context ***/
+	set_curr_aio_ctx(tcp);
+
 	if (entering(tcp)) {
 		/* ctx_id */
 		printaddr(tcp->u_arg[0]);
@@ -420,6 +475,9 @@ static int
 print_io_getevents(struct tcb *const tcp, const print_obj_by_addr_fn print_ts,
 		   const bool has_sig)
 {
+	/*** matching the corresponding context ***/
+	set_curr_aio_ctx(tcp);
+
 	if (entering(tcp)) {
 		kernel_long_t nr;
 
@@ -439,12 +497,14 @@ print_io_getevents(struct tcb *const tcp, const print_obj_by_addr_fn print_ts,
 	} else {
 		/* events */
 		struct io_event buf;
-		// collect io events
-		if (tcp->u_rval_bk > 0) {
+		// collect io events: u_rval has been tampered, so read from u_rval_old
+		if (tcp->u_rval_old > 0) {
 			tprints(" /**[COLLECT]: ");
-			print_array(tcp, tcp->u_arg[3], tcp->u_rval_bk, &buf, sizeof(buf),
+			print_array(tcp, tcp->u_arg[3], tcp->u_rval_old, &buf, sizeof(buf),
 						tfetch_mem, collect_io_event, 0);
 			tprints("**/ ");
+		} else {
+			tprints(" /**[NO COLLECT]**/ ");
 		}
 		// then do printing according to (tampered) retval
 		tprints("[");

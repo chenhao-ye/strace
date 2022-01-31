@@ -227,6 +227,7 @@ typedef struct ioctlent {
 # define INJECT_F_SYSCALL	0x20
 # define INJECT_F_POKE_ENTER	0x40
 # define INJECT_F_POKE_EXIT	0x80
+# define INJECT_F_DRAIN 0x100
 
 # define INJECT_ACTION_FLAGS	\
 	(INJECT_F_SIGNAL	\
@@ -236,10 +237,11 @@ typedef struct ioctlent {
 	|INJECT_F_DELAY_EXIT	\
 	|INJECT_F_POKE_ENTER	\
 	|INJECT_F_POKE_EXIT	\
+	|INJECT_F_DRAIN \
 	)
 
 struct inject_data {
-	uint8_t flags;		/* 8 of 8 flags are used */
+	uint16_t flags;		/* 8 of 8 flags are used */
 	uint8_t signo;		/* NSIG <= 128 */
 	uint16_t rval_idx;	/* index in retval_vec */
 	uint16_t delay_idx;	/* index in delay_data_vec */
@@ -257,8 +259,8 @@ struct inject_opts {
 # define INJECT_LAST_INF	((uint16_t) -1)
 
 struct aio_tag;
-#define AIO_DRAIN_TIMEOUT_NS 1000000 // 100 us
-extern struct timespec aio_last_aio;
+extern struct timespec drain_timeout;
+extern bool check_drain_timeout(void);
 
 # define MAX_ERRNO_VALUE			4095
 
@@ -275,7 +277,7 @@ struct tcb {
 	kernel_ulong_t true_scno;	/* Same, but without subcall decoding and shuffling */
 	kernel_ulong_t u_arg[MAX_ARGS];	/* System call arguments */
 	kernel_long_t u_rval;	/* Return value */
-	kernel_long_t u_rval_bk;	/* Return value (backup copy if tampered) */
+	kernel_long_t u_rval_old;	/* Return value (set when tampering u_rval) */
 	int sys_func_rval;	/* Syscall entry parser's return value */
 	int curcol;		/* Output column for this process */
 	FILE *outf;		/* Output file for this process */
