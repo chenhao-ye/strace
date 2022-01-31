@@ -587,6 +587,8 @@ tamper_with_syscall_exiting(struct tcb *tcp)
 	if (opts->data.flags & INJECT_F_DRAIN) {
 		if (check_drain_timeout())
 			set_success(tcp, 1);
+		else
+			set_success(tcp, 0);
 	}	else if (opts->data.flags & INJECT_F_RETVAL)
 		set_success(tcp, retval_get(opts->data.rval_idx));
 	else
